@@ -341,15 +341,6 @@ spec:
               "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
               explicit_http_config:
                 http2_protocol_options: {}
-          transport_socket:
-            name: envoy.transport_sockets.tls
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-              sni: payload-pre-processing.openshift-ingress.svc.cluster.local
-              common_tls_context:
-                alpn_protocols: ["h2"]
-                validation_context:
-                  trust_chain_verification: ACCEPT_UNTRUSTED
           load_assignment:
             cluster_name: payload-pre-processing-extproc
             endpoints:
@@ -374,15 +365,6 @@ spec:
               "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
               explicit_http_config:
                 http2_protocol_options: {}
-          transport_socket:
-            name: envoy.transport_sockets.tls
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-              sni: payload-processing.openshift-ingress.svc.cluster.local
-              common_tls_context:
-                alpn_protocols: ["h2"]
-                validation_context:
-                  trust_chain_verification: ACCEPT_UNTRUSTED
           load_assignment:
             cluster_name: payload-processing-extproc
             endpoints:
