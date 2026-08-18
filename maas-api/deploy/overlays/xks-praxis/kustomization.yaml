@@ -1,0 +1,82 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: maas-api-xks-praxis
+
+# xKS + Praxis overlay: cert-manager TLS (no OCP service-serving-certs) with
+# Praxis ExtProc IPP base instead of llm-d payload-processing.
+# Selected when MAAS_IPP_PROFILE=praxis on a non-OCP cluster.
+resources:
+  - ../../../../deployment/base/maas-api/overlays/tls
+  - ../../../../deployment/base/maas-controller/policies
+  - ../../../../deployment/base/payload-processing-praxis/default
+  - certificate.yaml
+
+namespace: opendatahub
+
+patches:
+  # Replace OCP service-ca ConfigMap with cert-manager CA secret
+  - target:
+      kind: Deployment
+      name: maas-api
+    patch: |
+      - op: replace
+        path: /spec/template/spec/volumes/1
+        value:
+          name: openshift-service-ca
+          secret:
+            secretName: opendatahub-ca
+            items:
+              - key: tls.crt
+                path: service-ca.crt
+            optional: true
+
+  # Remove OCP service-ca annotation
+  - target:
+      kind: Service
+      name: maas-api
+    patch: |
+      - op: remove
+        path: /metadata/annotations/service.beta.openshift.io~1serving-cert-secret-name
+
+  # Remove OCP CA bundle injection annotation
+  - target:
+      kind: ConfigMap
+      name: openshift-service-ca.crt
+    patch: |
+      - op: remove
+        path: /metadata/annotations/service.beta.openshift.io~1inject-cabundle
+
+  # Exclude monitoring resources (no Prometheus Operator on xKS)
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: PodMonitor
+      name: maas-api-metrics
+    patch: |
+      $patch: delete
+      apiVersion: monitoring.coreos.com/v1
+      kind: PodMonitor
+      metadata:
+        name: maas-api-metrics
+  - target:
+      kind: NetworkPolicy
+      name: maas-api-allow-monitoring
+    patch: |
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: maas-api-allow-monitoring
+
+  # Fix NetworkPolicy podSelector for gateway pods
+  - target:
+      kind: NetworkPolicy
+      name: payload-processing
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector
+        value:
+          matchLabels:
+            gateway.istio.io/managed: istio.io-gateway-controller
