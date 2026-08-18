@@ -80,3 +80,39 @@ patches:
         value:
           matchLabels:
             gateway.istio.io/managed: istio.io-gateway-controller
+
+  # Replace post-auth ConfigMap: llmisvc_model_provider_resolver is not yet
+  # available in praxis-extproc; use model_to_header until it lands.
+  - target:
+      kind: ConfigMap
+      name: payload-processing-plugins
+    patch: |-
+      - op: replace
+        path: /data/extproc.yaml
+        value: |
+          server:
+            grpc_address: "0.0.0.0:9004"
+            health_address: "0.0.0.0:50052"
+            metrics_address: "0.0.0.0:9090"
+            tls:
+              mode: none
+          filter_chains:
+            - name: ipp
+              filters:
+                - filter: request_id
+                - filter: model_to_header
+                  header: X-Gateway-Model-Name
+      - op: replace
+        path: /data/pre-extproc.yaml
+        value: |
+          server:
+            grpc_address: "0.0.0.0:9004"
+            health_address: "0.0.0.0:50052"
+            metrics_address: "0.0.0.0:9090"
+            tls:
+              mode: none
+          filter_chains:
+            - name: bbr
+              filters:
+                - filter: model_to_header
+                  header: X-Gateway-Model-Name
