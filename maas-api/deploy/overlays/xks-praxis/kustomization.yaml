@@ -81,19 +81,6 @@ patches:
           matchLabels:
             gateway.istio.io/managed: istio.io-gateway-controller
 
-  # Strip TLS transport_socket from EnvoyFilter CLUSTER patches — praxis-extproc
-  # runs with tls.mode=none, so Envoy must connect over plaintext h2c.
-  - target:
-      group: networking.istio.io
-      version: v1alpha3
-      kind: EnvoyFilter
-      name: payload-processing
-    patch: |-
-      - op: remove
-        path: /spec/configPatches/12/patch/value/transport_socket
-      - op: remove
-        path: /spec/configPatches/13/patch/value/transport_socket
-
   # Replace post-auth ConfigMap: llmisvc_model_provider_resolver is not yet
   # available in praxis-extproc; use model_to_header until it lands.
   - target:
