@@ -22,6 +22,7 @@ data:
         filters:
           - filter: model_to_header
             header: X-Gateway-Model-Name
+          - filter: publisher_model_rewrite
     insecure_options:
       allow_unbounded_body: true
   # IPP (post-auth) Praxis chain. Iterate as Praxis filters land.
