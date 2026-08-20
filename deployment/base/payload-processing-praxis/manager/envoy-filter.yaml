@@ -33,14 +33,12 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
             failure_mode_allow: true
             allow_mode_override: true
-            # BUFFERED: current Praxis stub filters reject FULL_DUPLEX_STREAMED
-            # (Envoy "spurious response message" / "no request headers").
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SKIP"
-              request_body_mode: "BUFFERED"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
               response_body_mode: "NONE"
-              request_trailer_mode: "SKIP"
+              request_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-pre-processing-extproc
@@ -66,10 +64,10 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
-              request_body_mode: "BUFFERED"
-              response_body_mode: "BUFFERED"
-              request_trailer_mode: "SKIP"
-              response_trailer_mode: "SKIP"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
+              response_body_mode: "FULL_DUPLEX_STREAMED"
+              request_trailer_mode: "SEND"
+              response_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-processing-extproc
@@ -96,9 +94,9 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SKIP"
-              request_body_mode: "BUFFERED"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
               response_body_mode: "NONE"
-              request_trailer_mode: "SKIP"
+              request_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-pre-processing-extproc
@@ -124,10 +122,10 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
-              request_body_mode: "BUFFERED"
-              response_body_mode: "BUFFERED"
-              request_trailer_mode: "SKIP"
-              response_trailer_mode: "SKIP"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
+              response_body_mode: "FULL_DUPLEX_STREAMED"
+              request_trailer_mode: "SEND"
+              response_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-processing-extproc
@@ -154,9 +152,9 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SKIP"
-              request_body_mode: "BUFFERED"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
               response_body_mode: "NONE"
-              request_trailer_mode: "SKIP"
+              request_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-pre-processing-extproc
@@ -182,10 +180,10 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
-              request_body_mode: "BUFFERED"
-              response_body_mode: "BUFFERED"
-              request_trailer_mode: "SKIP"
-              response_trailer_mode: "SKIP"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
+              response_body_mode: "FULL_DUPLEX_STREAMED"
+              request_trailer_mode: "SEND"
+              response_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-processing-extproc
@@ -213,9 +211,9 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SKIP"
-              request_body_mode: "BUFFERED"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
               response_body_mode: "NONE"
-              request_trailer_mode: "SKIP"
+              request_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-pre-processing-extproc
@@ -241,10 +239,10 @@ spec:
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
-              request_body_mode: "BUFFERED"
-              response_body_mode: "BUFFERED"
-              request_trailer_mode: "SKIP"
-              response_trailer_mode: "SKIP"
+              request_body_mode: "FULL_DUPLEX_STREAMED"
+              response_body_mode: "FULL_DUPLEX_STREAMED"
+              request_trailer_mode: "SEND"
+              response_trailer_mode: "SEND"
             grpc_service:
               envoy_grpc:
                 cluster_name: payload-processing-extproc
@@ -341,6 +339,14 @@ spec:
               "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
               explicit_http_config:
                 http2_protocol_options: {}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              common_tls_context:
+                validation_context:
+                  trust_chain_verification: ACCEPT_UNTRUSTED
+              sni: payload-pre-processing.openshift-ingress.svc.cluster.local
           load_assignment:
             cluster_name: payload-pre-processing-extproc
             endpoints:
@@ -365,6 +371,14 @@ spec:
               "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
               explicit_http_config:
                 http2_protocol_options: {}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              common_tls_context:
+                validation_context:
+                  trust_chain_verification: ACCEPT_UNTRUSTED
+              sni: payload-processing.openshift-ingress.svc.cluster.local
           load_assignment:
             cluster_name: payload-processing-extproc
             endpoints:

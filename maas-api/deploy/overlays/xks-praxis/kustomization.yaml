@@ -95,7 +95,7 @@ patches:
             health_address: "0.0.0.0:50052"
             metrics_address: "0.0.0.0:9090"
             tls:
-              mode: none
+              mode: self_signed
           filter_chains:
             - name: ipp
               filters:
@@ -110,7 +110,7 @@ patches:
             health_address: "0.0.0.0:50052"
             metrics_address: "0.0.0.0:9090"
             tls:
-              mode: none
+              mode: self_signed
           filter_chains:
             - name: bbr
               filters:

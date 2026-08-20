@@ -193,10 +193,11 @@ def _create_sa_token(sa_name, namespace=None, duration="10m"):
     )
     if sa_result.returncode != 0 and "already exists" not in sa_result.stderr:
         raise RuntimeError(f"Failed to create SA {sa_name}: {sa_result.stderr}")
-    result = subprocess.run(
-        ["oc", "create", "token", sa_name, "-n", namespace, f"--duration={duration}"],
-        capture_output=True, text=True,
-    )
+    cmd = ["oc", "create", "token", sa_name, "-n", namespace, f"--duration={duration}"]
+    audience = os.environ.get("SA_TOKEN_AUDIENCE", "")
+    if audience:
+        cmd.append(f"--audience={audience}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
     token = result.stdout.strip()
     if not token:
         raise RuntimeError(f"Could not create token for SA {sa_name}: {result.stderr}")
