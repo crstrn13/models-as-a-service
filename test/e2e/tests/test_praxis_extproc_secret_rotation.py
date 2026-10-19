@@ -2,25 +2,39 @@
 E2E test for in-place ExternalProvider auth Secret rotation under Praxis ExtProc.
 
 Covers RHOAIENG-97467: when the provider auth Secret is updated in place (same
-name/key, new value), external-provider inference must keep working through the
-Praxis ExtProc dataplane *without* deleting the ExtProc pod or the ExternalModel.
-This guards against the IPP resolver stall that was observed after credential
-updates (``demo.sh`` historically marked rotation NOT_DEMONSTRATED).
+name/key, new value), the praxis ExtProc dataplane must inject the *new*
+credential on upstream requests — keeping inference working *without* deleting
+the ExtProc pod or the ExternalModel. This guards against the resolver stall that
+was observed after credential updates (``demo.sh`` historically marked rotation
+NOT_DEMONSTRATED).
 
-The flow:
-  1. Confirm the default payload-processing stack is praxis-extproc (skip otherwise).
-  2. Stand up an ExternalProvider/ExternalModel egress route backed by a
-     credential Secret and prove authenticated egress is reachable.
-  3. Record the current ExtProc pod UIDs (payload-processing + pre-processing).
-  4. Rotate the provider Secret in place — same name, same key, new value.
-  5. Prove egress is still reachable (the resolver did not stall) while the ExtProc
-     pods were never replaced and the ExternalModel was never deleted/recreated.
+How the test actually verifies the rotation (not just "egress still works"):
+  The upstream is httpbingo's ``/anything`` echo endpoint, which returns the
+  request it received as JSON — including the ``Authorization`` header that
+  praxis-extproc's credential_inject put on the upstream request. So the test
+  reads back the *exact* credential the provider would have seen, and asserts it
+  flips from v1 to v2 after the in-place Secret rotation. That directly proves the
+  AC: the new credential reaches the upstream, and requests keep succeeding, with
+  no ExtProc/ExternalModel teardown.
 
-CAVEAT: the e2e upstream (httpbingo) does not validate the injected credential,
-so this proves the data plane keeps serving across an in-place Secret rotation
-without a restart — not that a bad credential would be rejected. The regression
-being guarded is the resolver stall, which is exactly a continued-success +
-no-restart signal.
+Praxis topology notes (why the resources live where they do):
+  * The praxis ``ai-gateway-controller`` only reconciles an inference.opendatahub.io
+    ExternalModel when its namespace carries a MaasTenantConfig — i.e. the tenant
+    (subscription) namespace. An ExternalModel in a plain model namespace (llm) is
+    left Pending ("no MaasTenantConfig"). So the ExternalProvider/ExternalModel,
+    the MaaSModelRef, and the credential Secret all live in the tenant namespace.
+  * The route AIGC creates (``external-model-<name>``) attaches to the tenant's
+    Gateway, so that Gateway's ``allowedRoutes`` must admit the tenant namespace
+    (deploy.sh adds it to ALLOWED_ROUTE_NAMESPACES).
+  * ExternalProvider auth must be ``type: apikey`` — the praxis reconciler rejects
+    the legacy ``simple`` strategy ("only apikey is supported").
+  * Credential injection runs in a dedicated per-tenant extproc Deployment
+    (``payload-processing-external-model``) in the tenant namespace; the request
+    body flows through the shared payload-processing / payload-pre-processing
+    stack. The rotation must not restart any of them.
+  * The gateway rewrites the ``/{tenant-ns}/{model}`` prefix to ``/``, so a
+    ``/anything/...`` suffix on the client URL lands on httpbingo's echo endpoint
+    upstream.
 """
 
 from __future__ import annotations
@@ -38,7 +52,6 @@ from multitenancy_helpers import (
     extproc_deployment_uses_praxis,
 )
 from test_helper import (
-    MODEL_NAMESPACE,
     RECONCILE_WAIT,
     TLS_VERIFY,
     _apply_cr,
@@ -67,6 +80,11 @@ def _subscription_ns():
     return os.environ.get("E2E_SUBSCRIPTION_NAMESPACE", _ns())
 
 
+# Praxis attaches external models to the tenant's Gateway, so the ExternalModel,
+# ExternalProvider, MaaSModelRef and credential Secret must co-locate in the
+# tenant (subscription) namespace — the only namespace with a MaasTenantConfig.
+EXTERNAL_NS = _subscription_ns()
+
 TARGET_MODEL = "gpt-3.5-turbo"
 
 EXTERNAL_MODEL_NAME = "e2e-rotation-external-model"
@@ -75,6 +93,14 @@ SECRET_NAME = f"{EXTERNAL_MODEL_NAME}-api-key"
 SECRET_KEY = "api-key"
 SUBSCRIPTION_NAME = "e2e-rotation-subscription"
 AUTH_POLICY_NAME = "e2e-rotation-access"
+
+# The route AIGC generates for an ExternalModel is prefixed with "external-model-".
+EXTERNAL_MODEL_ROUTE_NAME = f"external-model-{EXTERNAL_MODEL_NAME}"
+
+# httpbingo's /anything echoes the upstream request as JSON, letting us read back
+# the credential praxis-extproc injected. The gateway strips the /{ns}/{model}
+# prefix, so this suffix lands on /anything/... upstream.
+ECHO_PATH_SUFFIX = "/anything/v1/chat/completions"
 
 # Same name/key, new value — the "in place" rotation the AC describes.
 SECRET_VALUE_V1 = "e2e-rotation-key-v1"
@@ -88,14 +114,21 @@ EXTERNAL_PROVIDER_KIND = "externalproviders.inference.opendatahub.io"
 # Default-tenant praxis ExtProc Deployments (unsuffixed) in the gateway namespace.
 PROCESSING_DEPLOYMENT = "payload-processing"
 PRE_PROCESSING_DEPLOYMENT = "payload-pre-processing"
+# Per-tenant external-model extproc (credential injection) in the tenant namespace.
+EXTERNAL_MODEL_DEPLOYMENT = "payload-processing-external-model"
 
+# Baseline egress can race route/extproc warmup; rotation also waits for the
+# mounted Secret to propagate to the extproc. That propagation is bounded by the
+# kubelet sync period + cache TTL and was observed to take ~60-90s, so give the
+# rotation poll generous margin to avoid flakes.
 EGRESS_POLL_TIMEOUT = max(RECONCILE_WAIT * 6, 90)
+ROTATION_POLL_TIMEOUT = max(RECONCILE_WAIT * 24, 240)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _check_external_endpoint_reachable() -> bool:
-    """Verify the external endpoint is reachable. Skip tests if not."""
+    """Verify the external endpoint is reachable (and httpbin-compatible)."""
     for scheme in ("https", "http"):
         try:
             r = requests.get(f"{scheme}://{EXTERNAL_ENDPOINT}/get", timeout=10, verify=False)
@@ -123,21 +156,35 @@ def _skip_unless_default_praxis():
         pytest.skip("default tenant payload-processing is not praxis-extproc")
 
 
-def _extproc_pod_uids(deployment: str) -> set[str]:
-    """UIDs of a Deployment's current pods, to prove rotation did not replace them."""
+def _extproc_pod_uids(deployment: str, namespace: str, *, label: str | None = None) -> set[str]:
+    """UIDs of a Deployment's current pods, to prove rotation did not replace them.
+
+    The shared praxis stack is selected by the ``tenant-instance`` label; the
+    per-tenant external-model extproc uses a plain ``app`` label.
+    """
+    selector = label or f"{LABEL_TENANT_INSTANCE}={deployment}"
     result = _oc_run(
-        [
-            "get",
-            "pods",
-            "-n",
-            GATEWAY_NAMESPACE,
-            "-l",
-            f"{LABEL_TENANT_INSTANCE}={deployment}",
-            "-o",
-            "jsonpath={.items[*].metadata.uid}",
-        ]
+        ["get", "pods", "-n", namespace, "-l", selector, "-o", "jsonpath={.items[*].metadata.uid}"]
     )
     return {uid for uid in (result.stdout or "").split() if uid}
+
+
+def _all_extproc_uids() -> dict[str, set[str]]:
+    """Snapshot UIDs of every ExtProc pod that must survive the rotation."""
+    return {
+        PROCESSING_DEPLOYMENT: _extproc_pod_uids(PROCESSING_DEPLOYMENT, GATEWAY_NAMESPACE),
+        PRE_PROCESSING_DEPLOYMENT: _extproc_pod_uids(PRE_PROCESSING_DEPLOYMENT, GATEWAY_NAMESPACE),
+        EXTERNAL_MODEL_DEPLOYMENT: _extproc_pod_uids(
+            EXTERNAL_MODEL_DEPLOYMENT, EXTERNAL_NS, label=f"app={EXTERNAL_MODEL_DEPLOYMENT}"
+        ),
+    }
+
+
+def _extproc_uids_for(deployment: str) -> set[str]:
+    """Re-read one deployment's pod UIDs using the same selector as the snapshot."""
+    if deployment == EXTERNAL_MODEL_DEPLOYMENT:
+        return _extproc_pod_uids(deployment, EXTERNAL_NS, label=f"app={EXTERNAL_MODEL_DEPLOYMENT}")
+    return _extproc_pod_uids(deployment, GATEWAY_NAMESPACE)
 
 
 def _apply_provider_secret(value: str):
@@ -148,9 +195,9 @@ def _apply_provider_secret(value: str):
             "kind": "Secret",
             "metadata": {
                 "name": SECRET_NAME,
-                "namespace": MODEL_NAMESPACE,
-                # The apikey-injection plugin's secret store only watches Secrets
-                # carrying this label; without it credential lookups silently fail.
+                "namespace": EXTERNAL_NS,
+                # praxis-extproc's secret store only watches Secrets carrying this
+                # label; without it credential lookups silently fail.
                 "labels": {"inference.llm-d.ai/ipp-managed": "true"},
             },
             "type": "Opaque",
@@ -159,29 +206,52 @@ def _apply_provider_secret(value: str):
     )
 
 
-def _poll_egress_reachable(url: str, headers: dict, body: dict, *, timeout: int) -> requests.Response:
-    """POST until the request clears auth and reaches the external upstream.
+def _echoed_authorization(response: requests.Response) -> str | None:
+    """Pull the Authorization header the upstream received from an /anything echo.
 
-    Success = a non-auth response that is not a transient gateway/Authorino
-    flake. httpbingo returns 404 for ``/v1/chat/completions``, which still proves
-    the request left the cluster. 401/403 means auth blocked; empty 401 and
-    proxy-style 500/503 are retried (see ``_is_transient_gateway_response``).
+    httpbingo echoes headers as ``{"headers": {"Authorization": ["Bearer ..."]}}``.
+    """
+    try:
+        headers = response.json().get("headers", {})
+    except ValueError:
+        return None
+    value = headers.get("Authorization") or headers.get("authorization")
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _poll_injected_credential(url: str, headers: dict, body: dict, *, expected: str, timeout: int) -> str:
+    """POST to the echo upstream until the credential praxis injected == ``expected``.
+
+    The echoed Authorization header is exactly what credential_inject put on the
+    upstream request, so this proves the provider received that credential. Rides
+    out auth-propagation flakes (empty 401, proxy 500/503) and, after a rotation,
+    the mounted-Secret propagation lag.
     """
     deadline = time.time() + timeout
-    last = None
+    last_status = None
+    last_cred = None
     while time.time() < deadline:
         try:
-            last = requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
+            r = requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
         except requests.RequestException as exc:
-            log.info("Egress poll transient request error: %s", exc)
+            log.info("Echo poll transient request error: %s", exc)
             time.sleep(2)
             continue
-        if last.status_code not in (401, 403) and not _is_transient_gateway_response(last):
-            return last
-        log.info("Egress poll got %d, retrying...", last.status_code)
+        last_status = r.status_code
+        if r.status_code not in (401, 403) and not _is_transient_gateway_response(r):
+            last_cred = _echoed_authorization(r)
+            if last_cred == expected:
+                return last_cred
+            log.info("Echo poll: upstream credential=%r (want %r), retrying...", last_cred, expected)
+        else:
+            log.info("Echo poll got transient %d, retrying...", r.status_code)
         time.sleep(2)
-    status = last.status_code if last is not None else "no response"
-    raise AssertionError(f"External egress never became reachable (last status: {status})")
+    raise AssertionError(
+        f"upstream never received credential {expected!r} within {timeout}s "
+        f"(last status={last_status}, last credential={last_cred!r})"
+    )
 
 
 # ─── Fixture: external provider + model backed by a credential Secret ─────────
@@ -191,7 +261,8 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
     """Stand up an external egress route backed by a rotatable credential Secret."""
     _skip_unless_default_praxis()
 
-    log.info("Setting up external provider rotation fixture (endpoint: %s)...", EXTERNAL_ENDPOINT)
+    log.info("Setting up external provider rotation fixture (endpoint: %s, ns: %s)...",
+             EXTERNAL_ENDPOINT, EXTERNAL_NS)
     try:
         _apply_provider_secret(SECRET_VALUE_V1)
 
@@ -199,12 +270,13 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
             {
                 "apiVersion": "inference.opendatahub.io/v1alpha1",
                 "kind": "ExternalProvider",
-                "metadata": {"name": EXTERNAL_PROVIDER_NAME, "namespace": MODEL_NAMESPACE},
+                "metadata": {"name": EXTERNAL_PROVIDER_NAME, "namespace": EXTERNAL_NS},
                 "spec": {
                     "provider": "openai",
                     "endpoint": EXTERNAL_ENDPOINT,
                     "auth": {
-                        "type": "simple",
+                        # praxis reconciler only implements apikey; "simple" is rejected.
+                        "type": "apikey",
                         "secretRef": {"name": SECRET_NAME},
                     },
                 },
@@ -215,7 +287,7 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
             {
                 "apiVersion": "inference.opendatahub.io/v1alpha1",
                 "kind": "ExternalModel",
-                "metadata": {"name": EXTERNAL_MODEL_NAME, "namespace": MODEL_NAMESPACE},
+                "metadata": {"name": EXTERNAL_MODEL_NAME, "namespace": EXTERNAL_NS},
                 "spec": {
                     "externalProviderRefs": [
                         {
@@ -235,7 +307,7 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
                 "kind": "MaaSModelRef",
                 "metadata": {
                     "name": EXTERNAL_MODEL_NAME,
-                    "namespace": MODEL_NAMESPACE,
+                    "namespace": EXTERNAL_NS,
                     "annotations": {
                         "maas.opendatahub.io/endpoint": EXTERNAL_ENDPOINT,
                         "maas.opendatahub.io/provider": "openai",
@@ -251,9 +323,9 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
             {
                 "apiVersion": "maas.opendatahub.io/v1alpha1",
                 "kind": "MaaSAuthPolicy",
-                "metadata": {"name": AUTH_POLICY_NAME, "namespace": _subscription_ns()},
+                "metadata": {"name": AUTH_POLICY_NAME, "namespace": EXTERNAL_NS},
                 "spec": {
-                    "modelRefs": [{"name": EXTERNAL_MODEL_NAME, "namespace": MODEL_NAMESPACE}],
+                    "modelRefs": [{"name": EXTERNAL_MODEL_NAME, "namespace": EXTERNAL_NS}],
                     "subjects": {"groups": [{"name": "system:authenticated"}]},
                 },
             }
@@ -263,13 +335,13 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
             {
                 "apiVersion": "maas.opendatahub.io/v1alpha1",
                 "kind": "MaaSSubscription",
-                "metadata": {"name": SUBSCRIPTION_NAME, "namespace": _subscription_ns()},
+                "metadata": {"name": SUBSCRIPTION_NAME, "namespace": EXTERNAL_NS},
                 "spec": {
                     "owner": {"groups": [{"name": "system:authenticated"}]},
                     "modelRefs": [
                         {
                             "name": EXTERNAL_MODEL_NAME,
-                            "namespace": MODEL_NAMESPACE,
+                            "namespace": EXTERNAL_NS,
                             "tokenRateLimits": [{"limit": 10000, "window": "1h"}],
                         },
                     ],
@@ -277,10 +349,10 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
             }
         )
 
-        _wait_for_maas_auth_policy_phase(AUTH_POLICY_NAME, namespace=_subscription_ns())
-        _wait_for_maas_subscription_phase(SUBSCRIPTION_NAME, namespace=_subscription_ns())
-        _wait_for_httproute_accepted(EXTERNAL_MODEL_NAME, namespace=MODEL_NAMESPACE)
-        _wait_for_model_ready(EXTERNAL_MODEL_NAME, namespace=MODEL_NAMESPACE, timeout=120)
+        _wait_for_maas_auth_policy_phase(AUTH_POLICY_NAME, namespace=EXTERNAL_NS)
+        _wait_for_maas_subscription_phase(SUBSCRIPTION_NAME, namespace=EXTERNAL_NS)
+        _wait_for_httproute_accepted(EXTERNAL_MODEL_ROUTE_NAME, namespace=EXTERNAL_NS)
+        _wait_for_model_ready(EXTERNAL_MODEL_NAME, namespace=EXTERNAL_NS, timeout=120)
 
         log.info("Creating API key for rotation tests...")
         r = requests.post(
@@ -299,12 +371,12 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
         yield {"api_key": api_key, "gateway_url": gateway_url}
     finally:
         log.info("Cleaning up external provider rotation fixtures...")
-        _delete_cr("maasauthpolicy", AUTH_POLICY_NAME, _subscription_ns())
-        _delete_cr("maassubscription", SUBSCRIPTION_NAME, _subscription_ns())
-        _delete_cr("maasmodelref", EXTERNAL_MODEL_NAME, MODEL_NAMESPACE)
-        _delete_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, MODEL_NAMESPACE)
-        _delete_cr(EXTERNAL_PROVIDER_KIND, EXTERNAL_PROVIDER_NAME, MODEL_NAMESPACE)
-        _delete_cr("secret", SECRET_NAME, MODEL_NAMESPACE)
+        _delete_cr("maasauthpolicy", AUTH_POLICY_NAME, EXTERNAL_NS)
+        _delete_cr("maassubscription", SUBSCRIPTION_NAME, EXTERNAL_NS)
+        _delete_cr("maasmodelref", EXTERNAL_MODEL_NAME, EXTERNAL_NS)
+        _delete_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS)
+        _delete_cr(EXTERNAL_PROVIDER_KIND, EXTERNAL_PROVIDER_NAME, EXTERNAL_NS)
+        _delete_cr("secret", SECRET_NAME, EXTERNAL_NS)
 
 
 # ─── Test ──────────────────────────────────────────────────────────────────
@@ -312,11 +384,8 @@ def rotation_setup(gateway_url, headers, api_keys_base_url):
 class TestPraxisExtProcSecretRotation:
     """In-place provider Secret rotation keeps egress alive (RHOAIENG-97467)."""
 
-    def _egress_url(self, setup) -> str:
-        return f"{setup['gateway_url']}/{MODEL_NAMESPACE}/{EXTERNAL_MODEL_NAME}/v1/chat/completions"
-
-    def _request(self, setup):
-        url = self._egress_url(setup)
+    def _echo_request(self, setup):
+        url = f"{setup['gateway_url']}/{EXTERNAL_NS}/{EXTERNAL_MODEL_NAME}{ECHO_PATH_SUFFIX}"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {setup['api_key']}",
@@ -326,42 +395,35 @@ class TestPraxisExtProcSecretRotation:
 
     def test_in_place_secret_rotation_keeps_egress_without_extproc_restart(self, rotation_setup):
         setup = rotation_setup
-        url, headers, body = self._request(setup)
+        url, headers, body = self._echo_request(setup)
 
-        # 1. Baseline: egress is reachable through the praxis ExtProc dataplane.
-        before = _poll_egress_reachable(url, headers, body, timeout=EGRESS_POLL_TIMEOUT)
-        log.info("Baseline egress reachable: HTTP %d", before.status_code)
+        _poll_injected_credential(
+            url, headers, body, expected=f"Bearer {SECRET_VALUE_V1}", timeout=EGRESS_POLL_TIMEOUT
+        )
+        log.info("Baseline: upstream receives the v1 credential")
 
-        # 2. Snapshot the ExtProc pods that must survive the rotation untouched.
-        before_uids = {
-            d: _extproc_pod_uids(d)
-            for d in (PROCESSING_DEPLOYMENT, PRE_PROCESSING_DEPLOYMENT)
-        }
+        before_uids = _all_extproc_uids()
         for deployment, uids in before_uids.items():
             assert uids, f"no {deployment} pods found before rotation"
 
-        # 3. Rotate the credential in place: same name, same key, new value.
         _apply_provider_secret(SECRET_VALUE_V2)
-        secret = _get_cr("secret", SECRET_NAME, MODEL_NAMESPACE)
-        assert secret is not None, "provider Secret vanished after in-place rotation"
+        assert _get_cr("secret", SECRET_NAME, EXTERNAL_NS) is not None, (
+            "provider Secret vanished after in-place rotation"
+        )
         log.info("Provider Secret rotated in place (same name/key, new value)")
 
-        # Give the ExtProc secret store a beat to observe the updated value.
-        time.sleep(RECONCILE_WAIT)
+        _poll_injected_credential(
+            url, headers, body, expected=f"Bearer {SECRET_VALUE_V2}", timeout=ROTATION_POLL_TIMEOUT
+        )
+        log.info("After rotation: upstream receives the v2 credential")
 
-        # 4. Egress must still be reachable — the resolver did not stall.
-        after = _poll_egress_reachable(url, headers, body, timeout=EGRESS_POLL_TIMEOUT)
-        log.info("Egress still reachable after rotation: HTTP %d", after.status_code)
-
-        # 5a. The ExtProc pods were never restarted.
         for deployment, uids in before_uids.items():
-            after_uids = _extproc_pod_uids(deployment)
+            after_uids = _extproc_uids_for(deployment)
             assert uids <= after_uids, (
                 f"{deployment} pods were replaced during in-place rotation "
                 f"(before={uids}, after={after_uids}); rotation must not restart ExtProc"
             )
 
-        # 5b. The ExternalModel was never deleted/recreated.
-        assert _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, MODEL_NAMESPACE) is not None, (
+        assert _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS) is not None, (
             "ExternalModel disappeared during in-place Secret rotation"
         )

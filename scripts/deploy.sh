@@ -1648,6 +1648,14 @@ apply_kuadrant_cr() {
     if [[ -n "${MODEL_NAMESPACE:-}" && "${MODEL_NAMESPACE}" != "$NAMESPACE" ]]; then
       gateway_allowed_namespaces="${gateway_allowed_namespaces},${MODEL_NAMESPACE}"
     fi
+    # Praxis attaches inference.opendatahub.io ExternalModel HTTPRoutes
+    # (external-model-<name>) in the tenant/subscription namespace, so the tenant
+    # Gateway must admit it or those routes stay NotAllowedByListeners and external
+    # providers never serve. (MaaSAuthPolicy/MaaSSubscription also live here.)
+    local subscription_ns="${MAAS_SUBSCRIPTION_NAMESPACE:-models-as-a-service}"
+    if [[ -n "$subscription_ns" && "$subscription_ns" != "$NAMESPACE" && "$subscription_ns" != "$infra_ns" && "$subscription_ns" != "${MODEL_NAMESPACE:-}" ]]; then
+      gateway_allowed_namespaces="${gateway_allowed_namespaces},${subscription_ns}"
+    fi
   fi
 
   INGRESS_MODE="${INGRESS_MODE:-loadbalancer}" \
