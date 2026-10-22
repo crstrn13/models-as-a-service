@@ -40,8 +40,8 @@ type Config struct {
 	// Used to filter database queries to enforce tenant isolation.
 	TenantName string
 
-	// AITenantName is the AITenant CR name for this tenant (used for SubjectAccessReview authorization).
-	// Defaults to TenantName.
+	// AITenantName is the AITenant CR name for this MaaS API instance.
+	// Defaults to TenantName and identifies the tenant used for guardrail resolution.
 	AITenantName string
 
 	// AITenantNamespace is the namespace where AITenant CRs are created.

@@ -131,7 +131,7 @@ func (h *Handler) SelectSubscription(c *gin.Context) {
 		"requestedModel", req.RequestedModel,
 	)
 
-	response, err := h.selector.Select(req.Groups, req.Username, req.RequestedSubscription, req.RequestedModel)
+	response, err := h.selector.SelectWithContext(c.Request.Context(), req.Groups, req.Username, req.RequestedSubscription, req.RequestedModel)
 	if err != nil {
 		// NOTE: All error responses return http.StatusOK with error fields populated in SelectResponse.
 		// This is intentional for Authorino integration, which expects 200 OK responses with metadata
@@ -142,6 +142,7 @@ func (h *Handler) SelectSubscription(c *gin.Context) {
 		var multipleSubsErr *MultipleSubscriptionsError
 		var modelNotInSubErr *ModelNotInSubscriptionError
 		var modelUnhealthyErr *ModelUnhealthyError
+		var guardrailErr *GuardrailResolutionError
 
 		if errors.As(err, &noSubErr) {
 			h.recordRejection(constant.RejectionNoCapacity)
@@ -222,6 +223,20 @@ func (h *Handler) SelectSubscription(c *gin.Context) {
 			return
 		}
 
+		if errors.As(err, &guardrailErr) {
+			h.recordRejection(constant.RejectionGuardrailUnavailable)
+			h.logger.Error("Selected guardrails could not be resolved",
+				"error", guardrailErr.Unwrap(),
+				"subscription", req.RequestedSubscription,
+				"model", req.RequestedModel,
+			)
+			c.JSON(http.StatusOK, SelectResponse{
+				Error:   "guardrail_unavailable",
+				Message: "selected guardrails are unavailable",
+			})
+			return
+		}
+
 		// All other errors are internal server errors
 		h.logger.Error("Subscription selection failed",
 			"error", err.Error(),
@@ -239,6 +254,7 @@ func (h *Handler) SelectSubscription(c *gin.Context) {
 		"subscription", response.Name,
 		"organizationId", response.OrganizationID,
 	)
+	token.SetOrganizationID(c, response.OrganizationID)
 	c.JSON(http.StatusOK, response)
 }
 
@@ -358,27 +374,55 @@ func (h *Handler) ListSubscriptions(c *gin.Context) {
 	h = h.withContext(c)
 
 	c.Header("Cache-Control", "no-store")
-	userContextVal, exists := c.Get("user")
-	if !exists {
+	identityVal, identityExists := c.Get("verified_identity")
+	var identity *token.VerifiedIdentity
+	if identityExists {
+		verifiedIdentity, ok := identityVal.(*token.VerifiedIdentity)
+		if !ok {
+			h.logger.Error("Invalid verified identity context type")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": gin.H{
+					"message": "Internal server error",
+					"type":    "server_error",
+				}})
+			return
+		}
+		identity = verifiedIdentity
+	}
+
+	userContextVal, userExists := c.Get("user")
+	if !identityExists && !userExists {
 		// No identity headers from Authorino — return an empty list instead
-		// of failing.  This mirrors the /v1/models behaviour when no
+		// of failing. This mirrors the /v1/models behaviour when no
 		// LLMInferenceService is deployed.
 		h.logger.Debug("No auth context present, returning empty subscription list")
 		c.JSON(http.StatusOK, []SubscriptionInfo{})
 		return
 	}
-	userContext, ok := userContextVal.(*token.UserContext)
-	if !ok {
-		h.logger.Error("Invalid user context type")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": gin.H{
-				"message": "Internal server error",
-				"type":    "server_error",
-			}})
-		return
+
+	var userContext *token.UserContext
+	if userExists {
+		contextValue, ok := userContextVal.(*token.UserContext)
+		if !ok {
+			h.logger.Error("Invalid user context type")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": gin.H{
+					"message": "Internal server error",
+					"type":    "server_error",
+				}})
+			return
+		}
+		userContext = contextValue
 	}
 
-	accessible, err := h.selector.GetAllAccessible(userContext.Groups, userContext.Username)
+	var groups []string
+	var username string
+	if userContext != nil {
+		groups = userContext.Groups
+		username = userContext.Username
+	}
+
+	accessible, err := h.selector.ListInventory(groups, username, identity)
 	if err != nil {
 		h.logger.Error("Failed to list subscriptions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -389,12 +433,7 @@ func (h *Handler) ListSubscriptions(c *gin.Context) {
 		return
 	}
 
-	subs := make([]SubscriptionInfo, len(accessible))
-	for i, sub := range accessible {
-		subs[i] = ResponseToSubscriptionInfo(sub)
-	}
-
-	c.JSON(http.StatusOK, subs)
+	c.JSON(http.StatusOK, accessible)
 }
 
 // ListSubscriptionsForModel handles GET /v1/model/:model-id/subscriptions.

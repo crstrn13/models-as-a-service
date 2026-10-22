@@ -43,6 +43,9 @@ func praxisTestScheme(t *testing.T) *runtime.Scheme {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(maasv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(gwapiv1.Install(scheme))
+	scheme.AddKnownTypeWithName(externalModelGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(externalModelGVK.GroupVersion().WithKind("ExternalModelList"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(externalProviderGVK, &unstructured.Unstructured{})
 	return scheme
 }
 
@@ -184,7 +187,8 @@ func TestRunPlatform_PraxisSkipsIPPApply(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.False(t, result.DeploymentPending, "praxis tenant should not wait on IPP EnvoyFilter: %s", result.Detail)
+	assert.True(t, result.DeploymentPending, "praxis tenant must wait on shared EnvoyFilter even when SkipIPP")
+	assert.Contains(t, result.Detail, PayloadProcessingEnvoyFilterName(tenantName))
 
 	hasMaaSAPIDeployment := false
 	for _, res := range applied {
@@ -196,6 +200,60 @@ func TestRunPlatform_PraxisSkipsIPPApply(t *testing.T) {
 		}
 	}
 	assert.True(t, hasMaaSAPIDeployment, "expected maas-api Deployment to be applied")
+}
+
+func TestRunPlatform_PraxisReadyWithEnvoyFilter(t *testing.T) {
+	const (
+		tenantName = "praxis-team"
+		appNs      = "ai-tenant-praxis-team"
+		gwNS       = "openshift-ingress"
+		gwName     = "praxis-gateway"
+	)
+	scheme := praxisTestScheme(t)
+	tenant := praxisTenantConfig(appNs, tenantName)
+	tenant.Annotations[AnnotationPayloadProcessingStatus] = PayloadProcessingStatusCleanupComplete
+	mcfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+	}
+	gateway := &gwapiv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: gwName, Namespace: gwNS},
+	}
+	priority := PayloadProcessingEnvoyFilterPriority
+	ef := payloadProcessingEnvoyFilter(gwNS, PayloadProcessingEnvoyFilterName(tenantName), gwName, &priority)
+	platformContext := PlatformContext{
+		GatewayRef: maasv1alpha1.TenantGatewayRef{Namespace: gwNS, Name: gwName},
+		SkipIPP:    true,
+		Source:     "aitenant",
+	}
+
+	var applied []appliedResource
+	cl := runPlatformTestClient(t, scheme, []client.Object{
+		mcfg, gateway, tenant, readyMaaSAPIDeployment(appNs, tenantName), ef,
+	}, &applied)
+
+	result, err := RunPlatform(
+		context.Background(),
+		logr.Discard(),
+		cl,
+		scheme,
+		tenant,
+		platformContext,
+		platformOverlayManifestPath(t),
+		appNs,
+		"controller-ns",
+		"https://kubernetes.default.svc",
+		"opendatahub",
+		mcfg,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.DeploymentPending, result.Detail)
+
+	for _, res := range applied {
+		if isIPPResource(res.gvk, res.name) {
+			t.Fatalf("unexpected IPP resource applied for praxis tenant: %s %s/%s", res.gvk.String(), res.namespace, res.name)
+		}
+	}
 }
 
 func TestRunPlatform_PraxisCleansUpExistingIPPResources(t *testing.T) {
@@ -265,6 +323,197 @@ func TestRunPlatform_PraxisCleansUpExistingIPPResources(t *testing.T) {
 	gotTenant := &maasv1alpha1.MaasTenantConfig{}
 	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Namespace: appNs, Name: maasv1alpha1.MaasTenantConfigInstanceName}, gotTenant))
 	assert.Equal(t, PayloadProcessingStatusCleanupComplete, gotTenant.Annotations[AnnotationPayloadProcessingStatus])
+}
+
+func TestRunPlatform_PraxisBlocksCleanupForNonStandardPluginsConfigMap(t *testing.T) {
+	const (
+		tenantName = "praxis-team"
+		appNs      = "ai-tenant-praxis-team"
+		gwNS       = "openshift-ingress"
+		gwName     = "praxis-gateway"
+	)
+	scheme := praxisTestScheme(t)
+	tenant := praxisTenantConfig(appNs, tenantName)
+	mcfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+	}
+	gateway := &gwapiv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: gwName, Namespace: gwNS},
+	}
+	ippDeployment := unstructuredIPPObject(GVKDeployment, gwNS, PayloadProcessingDeploymentName(tenantName), nil)
+	setConfigControllerOwnerRef(ippDeployment, mcfg.UID)
+	pluginsCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      PayloadProcessingPluginsConfigMapForTenant(tenantName),
+			Namespace: gwNS,
+		},
+		Data: map[string]string{
+			ippPreProcessingConfigKey: defaultPreProcessingYAML,
+			ippProcessingConfigKey: `apiVersion: llm-d.ai/v1alpha1
+kind: PayloadProcessorConfig
+plugins:
+- type: custom-only
+profiles:
+- name: default
+  plugins:
+    request:
+    - pluginRef: custom-only
+    response: []
+`,
+		},
+	}
+	platformContext := PlatformContext{
+		GatewayRef: maasv1alpha1.TenantGatewayRef{Namespace: gwNS, Name: gwName},
+		SkipIPP:    true,
+		Source:     "aitenant",
+	}
+
+	cl := newSSAFakeClientBuilder(scheme).WithObjects(
+		mcfg, gateway, tenant, readyMaaSAPIDeployment(appNs, tenantName), ippDeployment, pluginsCM,
+	).Build()
+
+	result, err := RunPlatform(
+		context.Background(),
+		logr.Discard(),
+		cl,
+		scheme,
+		tenant,
+		platformContext,
+		platformOverlayManifestPath(t),
+		appNs,
+		"controller-ns",
+		"https://kubernetes.default.svc",
+		"opendatahub",
+		mcfg,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.DeploymentPending)
+	assert.Contains(t, result.Detail, AnnotationForcePayloadProcessingMigration)
+	require.NotEmpty(t, result.Warnings)
+	assert.Contains(t, result.Warnings[0], AnnotationForcePayloadProcessingMigration)
+
+	// IPP Deployment must remain until force annotation is applied.
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(GVKDeployment)
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+		Namespace: gwNS,
+		Name:      PayloadProcessingDeploymentName(tenantName),
+	}, dep))
+
+	// Non-IPP apply still runs while migration is blocked (maas-api stays ready).
+	apiDep := &appsv1.Deployment{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+		Namespace: appNs,
+		Name:      MaaSAPIDeploymentName(tenantName),
+	}, apiDep))
+
+	gotTenant := &maasv1alpha1.MaasTenantConfig{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+		Namespace: appNs,
+		Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+	}, gotTenant))
+	assert.Equal(t, PayloadProcessingMigrationBlocked, gotTenant.Annotations[AnnotationPayloadProcessingMigration])
+	assert.Empty(t, gotTenant.Annotations[AnnotationPayloadProcessingStatus])
+}
+
+func TestRunPlatform_PraxisForceAnnotationUnblocksCleanup(t *testing.T) {
+	const (
+		tenantName = "praxis-team"
+		appNs      = "ai-tenant-praxis-team"
+		gwNS       = "openshift-ingress"
+		gwName     = "praxis-gateway"
+	)
+	scheme := praxisTestScheme(t)
+	tenant := praxisTenantConfig(appNs, tenantName)
+	// Simulate the reconcile after an operator applies the force annotation on a
+	// previously blocked tenant: blocked marker remains until cleanup succeeds.
+	tenant.Annotations[AnnotationPayloadProcessingMigration] = PayloadProcessingMigrationBlocked
+	tenant.Annotations[AnnotationForcePayloadProcessingMigration] = "true"
+	mcfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+	}
+	gateway := &gwapiv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: gwName, Namespace: gwNS},
+	}
+	ippDeployment := unstructuredIPPObject(GVKDeployment, gwNS, PayloadProcessingDeploymentName(tenantName), nil)
+	setConfigControllerOwnerRef(ippDeployment, mcfg.UID)
+	pluginsCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      PayloadProcessingPluginsConfigMapForTenant(tenantName),
+			Namespace: gwNS,
+		},
+		Data: map[string]string{
+			ippPreProcessingConfigKey: defaultPreProcessingYAML,
+			ippProcessingConfigKey: `apiVersion: llm-d.ai/v1alpha1
+kind: PayloadProcessorConfig
+plugins:
+- type: custom-only
+profiles:
+- name: default
+  plugins:
+    request:
+    - pluginRef: custom-only
+    response: []
+`,
+		},
+	}
+	platformContext := PlatformContext{
+		GatewayRef: maasv1alpha1.TenantGatewayRef{Namespace: gwNS, Name: gwName},
+		SkipIPP:    true,
+		Source:     "aitenant",
+	}
+
+	cl := newSSAFakeClientBuilder(scheme).WithObjects(
+		mcfg, gateway, tenant, readyMaaSAPIDeployment(appNs, tenantName), ippDeployment, pluginsCM,
+	).Build()
+
+	result, err := RunPlatform(
+		context.Background(),
+		logr.Discard(),
+		cl,
+		scheme,
+		tenant,
+		platformContext,
+		platformOverlayManifestPath(t),
+		appNs,
+		"controller-ns",
+		"https://kubernetes.default.svc",
+		"opendatahub",
+		mcfg,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(GVKDeployment)
+	err = cl.Get(context.Background(), types.NamespacedName{
+		Namespace: gwNS,
+		Name:      PayloadProcessingDeploymentName(tenantName),
+	}, dep)
+	require.True(t, apierrors.IsNotFound(err), "force annotation should allow IPP cleanup")
+
+	gotTenant := &maasv1alpha1.MaasTenantConfig{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+		Namespace: appNs,
+		Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+	}, gotTenant))
+	assert.Equal(t, PayloadProcessingStatusCleanupComplete, gotTenant.Annotations[AnnotationPayloadProcessingStatus])
+	assert.Empty(t, gotTenant.Annotations[AnnotationPayloadProcessingMigration],
+		"blocked migration annotation is cleared after successful cleanup")
+	// Force annotation is operator-managed and is not cleared by the controller.
+	assert.Equal(t, "true", gotTenant.Annotations[AnnotationForcePayloadProcessingMigration])
+	assert.Equal(t, APITranslationMigrationRiskForced, gotTenant.Annotations[AnnotationAPITranslationMigrationRisk])
+
+	// The accepted-risk warning must survive the one-shot ConfigMap cleanup and
+	// be present on later steady-state reconciles.
+	steadyResult, err := RunPlatform(
+		context.Background(), logr.Discard(), cl, scheme, gotTenant, platformContext,
+		platformOverlayManifestPath(t), appNs, "controller-ns", "https://kubernetes.default.svc", "opendatahub", mcfg,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, steadyResult.Warnings)
+	require.Contains(t, steadyResult.Warnings[0], "forced migration accepts compatibility loss")
 }
 
 func TestRunPlatform_PraxisMigrationCleanupSkipsPraxisOwnedResources(t *testing.T) {

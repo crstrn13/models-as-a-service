@@ -123,6 +123,21 @@ kubectl get persesdashboard -A -o json | jq -r '
 
 #### Operator-managed dashboards
 
+During upgrade, the MaaS controller removes the stale 3.4 metrics dashboard
+`dashboard-3-maas-usage-admin`, datasource `kuadrant-prometheus-datasource`, and
+ConfigMap `prometheus-web-tls-ca` from its applications namespace (for example,
+`redhat-ods-applications`). The dashboard is preserved when `spec.display.name`
+is `Usage (legacy)`, identifying the current opt-in metrics dashboard even when
+the applications and monitoring namespaces are the same. The obsolete datasource
+and ConfigMap are removed by name; resources with other names or in other
+namespaces are unaffected.
+
+The lifecycle reconciler runs general stale-resource cleanup before module setup,
+independently of monitoring configuration. Cleanup runs once successfully per
+controller lifetime. Concurrent reconciliations are serialized, failures are retried
+on subsequent reconciliation, and missing Perses APIs leave cleanup pending until
+they are available.
+
 Requires a running **maas-controller** (`LifecycleReconciler`), a `Config` instance, a monitoring namespace, and Perses CRDs (`PersesAvailable`). See [Setup](setup.md).
 
 Usage-log dashboards (`dashboard-4`, `dashboard-5`) are reconciled whenever `Config/default` exists. Setting `usageLogging` does not remove them. Deleting `Config/default` garbage-collects controller-owned copies.
@@ -184,7 +199,8 @@ kubectl exec -n <namespace> <pod> -- curl localhost:<port>/metrics
 kubectl get servicemonitor -n <namespace> \
   -l 'monitoring.opendatahub.io/scrape=true'
 
-# 3. Verify ODH monitoring stack enabled
+# 3. Verify ODH monitoring stack enabled.
+#    MaasTenantConfig is Degraded for a missing stack only when Config.spec.usageMetricsDashboard is true and tenant telemetry is enabled.
 kubectl get maastenantconfig default-tenant -n models-as-a-service  -o json | jq '.status.conditions[] | select(.type=="Degraded" or .type=="MaaSPrerequisitesAvailable") | {type, status, message}'
 
 kubectl get dscinitialization default-dsci -o json | jq '.status.conditions[] | select(.type=="MonitoringReady" or .type=="MonitoringStackAvailable") | {type, status}'
@@ -204,9 +220,12 @@ curl -s -H "Authorization: Bearer $(oc whoami -t)" --get \
 ### Troubleshooting Dashboard Issues
 
 ```bash
-# 1. Confirm Perses is available (ODH/RHOAI observability console)
+# 1. Confirm Perses is available (ODH/RHOAI observability console).
+#    When tenant telemetry is enabled, MaasTenantConfig is Degraded unless PersesAvailable is True.
+#    When usageLogging is false, it is also Degraded unless LokiStackAvailable and
+#    UsageLogsCollectorAvailable are True. See Setup.
 kubectl get dscinitialization default-dsci -o json | \
-  jq '.status.conditions[] | select(.type=="PersesAvailable") | {type, status}'
+  jq '.status.conditions[] | select(.type=="PersesAvailable" or .type=="LokiStackAvailable" or .type=="UsageLogsCollectorAvailable") | {type, status}'
 
 # 2. Confirm PersesDashboard CRs exist
 kubectl get persesdashboard -A | grep maas

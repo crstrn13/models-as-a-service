@@ -10,13 +10,13 @@ Lifecycle-invalidated rows, including regular and ephemeral keys, are soft-delet
 
 ## Bulk Key Revocation
 
-Platform administrators can bulk revoke API keys by **user**, by **subscription**, or both. A **dry-run** mode is available to preview how many keys would be revoked before committing.
+Platform administrators can bulk revoke API keys by **user**, by **subscription**, or both. A verified SSO organization administrator can revoke keys only for an explicit MaaS Subscription that is associated with an organization they administer. A **dry-run** mode is available to preview how many keys would be revoked before committing.
 
 ## Organization Association and Subscription Names
 
 API keys remain bound to the user who created them and to the `(MaaS Tenant, subscription name)` pair. MaaS does not add a runtime registry that distinguishes multiple incarnations of the same subscription name.
 
-`MaaSSubscription.spec.organization.id` is an optional, non-empty string and a stable association for delegated administration. A legacy subscription can gain the field once, only after an administrator or provisioning process has verified that the existing keys and history really belong to that organization. After the field is set, it cannot be changed or removed. Omitting it preserves legacy behavior and grants no organization-administration permission. Organization administration does not grant inference access, API-key creation, or model access; owners and MaaSAuthPolicy subjects continue to control those paths independently.
+`MaaSSubscription.spec.organization.id` is an optional, non-empty string and a stable association for delegated administration. A legacy subscription can gain the field once, only after an administrator or provisioning process has verified that the existing keys and history really belong to that organization. After the field is set, it cannot be changed or removed. Omitting it preserves legacy behavior and grants no organization-administration permission. Organization administration does not grant inference access, API-key creation, or model access; owners and MaaSAuthPolicy subjects continue to control those paths independently. When set, the stable organization ID is the authoritative source for subscription-scoped `organization_id` telemetry; `tokenMetadata.organizationId` remains the legacy fallback.
 
 Subscription names must be unique and must not be reused or reassigned within a MaaS Tenant, especially when subscriptions from multiple organizations share that Tenant. Reusing a name can expose the previous subscription's remaining key metadata and revocation scope to the new organization administrators, and historical usage may remain associated with that name. MaaS documents this limitation but does not automatically detect or prevent name reuse. Before assigning an organization to a legacy subscription, verify its key and history association, revoke or migrate any unrelated keys, and retain an audit record of the adoption decision.
 
@@ -107,13 +107,13 @@ curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys/bulk-revoke" \
 | Field | Required | Description |
 |-------|----------|-------------|
 | `username` | Optional (at least one of `username` or `subscription` must be provided) | Target user whose keys should be revoked. Regular users can only specify their own username; specifying another user requires admin privileges. |
-| `subscription` | Optional (at least one of `username` or `subscription` must be provided) | MaaSSubscription name whose bound keys should be revoked. Admin-only. |
+| `subscription` | Optional (at least one of `username` or `subscription` must be provided) | MaaSSubscription name or `namespace/name` alias whose bound keys should be revoked. Requires platform-admin authorization, or delegated authorization for that subscription. |
 | `dryRun` | Optional | When `true`, returns the count of keys that would be revoked without performing any mutation. Default: `false`. |
 
 ### Authorization
 
 !!! warning "Administrative privilege required"
-    Subscription-scoped and cross-user revocation require admin privileges. Regular users can only revoke their own keys via `DELETE /v1/api-keys/{id}` or bulk revoke with their own username.
+    Subscription-scoped revocation requires platform-admin authorization or delegated subscription-admin authorization. Cross-user revocation requires platform-admin authorization, or delegated subscription-admin authorization when an explicit subscription is supplied. Regular users can only revoke their own keys via `DELETE /v1/api-keys/{id}` or bulk revoke with their own username. A delegated administrator cannot use a username-only request to revoke keys across subscriptions.
 
 ### Use Cases
 

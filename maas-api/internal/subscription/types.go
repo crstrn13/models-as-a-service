@@ -1,6 +1,10 @@
 package subscription
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/authpolicy"
+)
 
 const (
 	// PurposeSelect preserves the existing inference-selection callback mode.
@@ -38,23 +42,28 @@ type SelectResponse struct {
 	// responses omit it so existing Authorino consumers see no schema change.
 	Purpose string `json:"purpose,omitempty"`
 	// Success fields (populated when selection succeeds)
-	Name           string            `json:"name,omitempty"`           // Subscription name
-	Namespace      string            `json:"namespace,omitempty"`      // Subscription namespace
-	DisplayName    string            `json:"displayName,omitempty"`    // Human-friendly display name for UI
-	Description    string            `json:"description,omitempty"`    // Subscription description
-	Priority       int32             `json:"priority,omitempty"`       // Subscription priority
-	ModelRefs      []ModelRefInfo    `json:"modelRefs,omitempty"`      // Model references with rate limits
-	OrganizationID string            `json:"organizationId,omitempty"` // Organization ID for billing
-	CostCenter     string            `json:"costCenter,omitempty"`     // Cost center for attribution
-	Labels         map[string]string `json:"labels,omitempty"`         // Additional tracking labels
+	Name           string         `json:"name,omitempty"`           // Subscription name
+	Namespace      string         `json:"namespace,omitempty"`      // Subscription namespace
+	DisplayName    string         `json:"displayName,omitempty"`    // Human-friendly display name for UI
+	Description    string         `json:"description,omitempty"`    // Subscription description
+	Priority       int32          `json:"priority,omitempty"`       // Subscription priority
+	ModelRefs      []ModelRefInfo `json:"modelRefs,omitempty"`      // Model references with rate limits
+	OrganizationID string         `json:"organizationId,omitempty"` // Organization ID for billing
+	// AssociatedOrganizationID carries the administrative association internally
+	// without changing the Authorino callback response contract.
+	AssociatedOrganizationID string            `json:"-"`
+	CostCenter               string            `json:"costCenter,omitempty"` // Cost center for attribution
+	Labels                   map[string]string `json:"labels,omitempty"`     // Additional tracking labels
 	// ResolvedModel is the MaaSModelRef identity (namespace/name) after resolving
 	// body-based aliases such as publishers/{ns}/models/{served-id}. Used by the
 	// gateway AuthPolicy to build selected_subscription_key (telemetry/debug) and,
 	// with namespace/name, to derive RateLimitID for TokenRateLimitPolicy matching.
 	ResolvedModel string `json:"resolvedModel,omitempty"`
-	// RateLimitID is a short stable hash of namespace/name@resolvedModel. AuthPolicy
-	// copies it to auth.identity.selected_subscription_id for TokenRateLimitPolicy
-	// when-predicates so the WASM shim does not embed long subscription keys.
+	// RateLimitID is a short stable hash of namespace/name@resolvedModel, set
+	// only for subscriptions created after the short-ID rollout
+	// (status.rateLimitIdentity=short). AuthPolicy copies it to
+	// auth.identity.selected_subscription_id. Pre-upgrade subscriptions omit
+	// this field and keep matching on selected_subscription_key.
 	RateLimitID string `json:"rateLimitId,omitempty"`
 	// Objective is the InferenceObjective name for ResolvedModel from the subscription's
 	// status.flowControlStatuses. AuthPolicy injects it as the llm-d objective header; empty
@@ -62,6 +71,10 @@ type SelectResponse struct {
 	Objective string `json:"objective,omitempty"`
 	// FairnessID is the tenant name. AuthPolicy injects it as the llm-d fairness ID header.
 	FairnessID string `json:"fairnessId,omitempty"`
+	// SelectedGuardrailChecks is the sparse set of effective guardrail check IDs.
+	// When a guardrail resolver is configured, a successful model selection returns
+	// a non-nil map, including when no guardrail checks apply.
+	SelectedGuardrailChecks *map[string]bool `json:"selectedGuardrailChecks,omitempty"`
 
 	// Access control (populated from MaaSAuthPolicy check)
 	AccessAllowed bool `json:"accessAllowed"` // no omitempty — false is a meaningful denial signal
@@ -102,13 +115,22 @@ type AdminScope struct {
 // Contains everything from the MaaSSubscription spec except owner.
 type SubscriptionInfo struct {
 	SubscriptionIDHeader    string            `json:"subscription_id_header"`
+	Namespace               string            `json:"-"`
 	SubscriptionDescription string            `json:"subscription_description"`
 	DisplayName             string            `json:"display_name,omitempty"`
 	Priority                int32             `json:"priority"`
 	ModelRefs               []ModelRefInfo    `json:"model_refs"`
+	Roles                   []string          `json:"roles,omitempty"`
 	OrganizationID          string            `json:"organization_id,omitempty"`
 	CostCenter              string            `json:"cost_center,omitempty"`
 	Labels                  map[string]string `json:"labels,omitempty"`
+	Owner                   *SubjectInventory `json:"owner,omitempty"`
+}
+
+// SubjectInventory identifies subscription owners that also have model access.
+type SubjectInventory struct {
+	Groups []authpolicy.GroupReference `json:"groups,omitempty"`
+	Users  []string                    `json:"users,omitempty"`
 }
 
 // ModelRefInfo represents a model reference with its rate limits.
@@ -123,6 +145,8 @@ type ModelRefInfo struct {
 	// Unlimited means no token budget is enforced for this model; usage is still metered.
 	Unlimited   bool         `json:"unlimited,omitempty"`
 	BillingRate *BillingRate `json:"billing_rate,omitempty"`
+	// Subjects is populated only for organization-admin inventory.
+	Subjects *SubjectInventory `json:"subjects,omitempty"`
 }
 
 // TokenRateLimit defines a token rate limit.

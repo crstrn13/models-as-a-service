@@ -30,6 +30,8 @@
 #   E2E_RECONCILE_WAIT            seconds between reconcile polls (default: 4)
 #   ARTIFACTS_DIR                 output directory for JUnit/HTML (default: test/e2e/reports)
 #   MAAS_PYTEST_INCLUDE_NIGHTLY   When true, run pass 3 (-m nightly) after serial pass
+#   E2E_RUN_ONLY_OIDC_TESTS       When true, skip passes 1–2 and run only pass 3 (external
+#                                 OIDC tests); requires EXTERNAL_OIDC=true
 #
 # Usage:
 #   export GATEWAY_HOST=maas.apps.cluster.example.com TOKEN=$(oc whoami -t) ...
@@ -118,6 +120,24 @@ _include_nightly_pass=false
 case "${MAAS_PYTEST_INCLUDE_NIGHTLY:-false}" in
     1 | true | TRUE | yes | YES) _include_nightly_pass=true ;;
 esac
+# E2E_RUN_ONLY_OIDC_TESTS skips passes 1–2 and runs only pass 3, which holds the
+# external OIDC tests. The dedicated OIDC CI job uses it because /group-test
+# already covers passes 1–2.
+_run_only_oidc_tests=false
+case "${E2E_RUN_ONLY_OIDC_TESTS:-false}" in
+    1 | true | TRUE | yes | YES) _run_only_oidc_tests=true ;;
+esac
+if [[ "$_run_only_oidc_tests" == true ]]; then
+    if [[ "${EXTERNAL_OIDC:-false}" != "true" ]]; then
+        echo "ERROR: E2E_RUN_ONLY_OIDC_TESTS=true requires EXTERNAL_OIDC=true; the OIDC tests skip without it" >&2
+        exit 1
+    fi
+    if [[ "$serial_only" == "true" ]]; then
+        echo "ERROR: E2E_RUN_ONLY_OIDC_TESTS=true cannot be combined with --serial-only" >&2
+        exit 1
+    fi
+    _include_nightly_pass=true
+fi
 _parallel_marker="not serial and not legacy_ipp${_nightly_exclude}"
 _serial_marker="serial and not legacy_ipp${_nightly_exclude}"
 _pass_total=2
@@ -272,7 +292,10 @@ maybe_run_nightly_pass() {
     run_nightly_pass
 }
 
-if [[ "$serial_only" == "true" ]]; then
+if [[ "$_run_only_oidc_tests" == "true" ]]; then
+    echo "Running E2E tests (OIDC tests only, E2E_RUN_ONLY_OIDC_TESTS=true; passes 1–2 skipped)"
+    run_nightly_pass
+elif [[ "$serial_only" == "true" ]]; then
     echo "Running E2E tests (serial pass only, -m '${_serial_marker}')"
     run_serial_pass
 elif [[ "$E2E_PARALLEL_WORKERS" -le 1 ]]; then

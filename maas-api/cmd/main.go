@@ -83,7 +83,7 @@ func serve() error {
 
 	metricsRegistry := prometheus.NewRegistry()
 
-	cluster, err := config.NewClusterConfig(cfg.Namespace, cfg.MaaSSubscriptionNamespace, constant.DefaultResyncPeriod, cfg.SARCacheMaxSize, metricsRegistry, log)
+	cluster, err := config.NewClusterConfig(cfg.AITenantNamespace, cfg.MaaSSubscriptionNamespace, constant.DefaultResyncPeriod, cfg.SARCacheMaxSize, metricsRegistry, log)
 	if err != nil {
 		return fmt.Errorf("failed to create cluster config: %w", err)
 	}
@@ -260,7 +260,14 @@ func registerHandlers(
 	authPolicyChecker := authpolicy.NewChecker(log, cluster.MaaSAuthPolicyLister)
 	subscriptionSelector := subscription.NewSelector(log, cluster.MaaSSubscriptionLister, cluster.MaaSModelRefLister, authPolicyChecker,
 		subscription.WithTenantName(cfg.TenantName),
-		subscription.WithSubscriptionNamespace(cfg.MaaSSubscriptionNamespace))
+		subscription.WithSubscriptionNamespace(cfg.MaaSSubscriptionNamespace),
+		subscription.WithGuardrailPlanResolver(subscription.NewGuardrailPlanResolver(
+			cfg.AITenantNamespace,
+			cfg.AITenantName,
+			cluster.AITenantGetter,
+			cluster.MaasTenantConfigGetter,
+			cluster.AIGuardrailGetter,
+		)))
 
 	resolveCtx, resolveCancel := context.WithTimeout(ctx, time.Duration(cfg.AccessCheckTimeoutSeconds)*time.Second)
 	gatewayInternalHost, err := config.ResolveGatewayInternalHost(resolveCtx, cluster.ClientSet, cfg.GatewayName, cfg.GatewayNamespace)
@@ -285,7 +292,13 @@ func registerHandlers(
 
 	apiKeyService := api_keys.NewServiceWithLogger(store, cfg, subscriptionSelector, log)
 	apiKeyService.StartDebounceCleanup(ctx)
-	apiKeyHandler := api_keys.NewHandler(log, apiKeyService, cluster.AdminChecker, metricsRecorder)
+	apiKeyHandler := api_keys.NewHandler(
+		log,
+		apiKeyService,
+		cluster.AdminChecker,
+		metricsRecorder,
+		subscriptionSelector,
+	)
 
 	tenantLogCfg := middleware.TenantLoggerConfig{
 		DefaultTenant:   cfg.TenantName,
@@ -300,6 +313,10 @@ func registerHandlers(
 		middleware.TenantLogger(log, tenantLogCfg),
 	)
 	v1Routes.GET("/models", append(modelAuthMiddleware, modelsHandler.ListLLMs)...)
+
+	// /v1/me is intentionally SSO-only. Legacy username/group headers and API
+	// keys cannot reconstruct the verified OIDC identity response.
+	v1Routes.GET("/me", tokenHandler.ExtractVerifiedIdentity(), tokenHandler.GetMe)
 
 	// Management routes may receive the new verified-identity envelope. Keeping
 	// it optional here preserves older gateways and deployments with no

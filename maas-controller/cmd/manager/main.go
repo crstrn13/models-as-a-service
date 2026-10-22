@@ -1089,6 +1089,10 @@ func setupWebhooks(mgr ctrl.Manager, aitenantNamespace, gatewayNamespace string)
 		return fmt.Errorf("MaaSModelRef webhook: %w", err)
 	}
 
+	if err := (&webhook.ExternalModelValidator{}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("ExternalModel webhook: %w", err)
+	}
+
 	return nil
 }
 

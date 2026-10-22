@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -32,7 +33,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	netwv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -103,6 +103,9 @@ type LifecycleReconciler struct {
 	DiscoveryLogLevel           string
 	DiscoveryNamespace          string
 	DiscoveryReplicas           *int32
+
+	staleResourcesCleanupMu        sync.Mutex
+	staleResourcesCleanupCompleted bool
 }
 
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
@@ -158,6 +161,10 @@ func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		} else if res != nil {
 			return *res, nil
+		}
+		// Upgrade cleanup is independent of observability and other module setup.
+		if err := r.cleanupStaleResources(ctx, log); err != nil {
+			return ctrl.Result{}, err
 		}
 		if err := r.ensureObservability(ctx, log); err != nil {
 			return ctrl.Result{}, err
@@ -224,6 +231,11 @@ func (r *LifecycleReconciler) ensureDefaultAITenantReferencesConfig(ctx context.
 			return nil, nil
 		}
 		return nil, err
+	}
+	if !aitenant.DeletionTimestamp.IsZero() || aitenant.Status.Phase == "Terminating" {
+		log.V(1).Info("skipping Config owner reference on terminating default AITenant",
+			"namespace", r.AITenantNamespace)
+		return nil, nil
 	}
 	if aitenantReferencesConfig(&aitenant, &cfg) {
 		return nil, nil
@@ -1098,8 +1110,9 @@ func (r *LifecycleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		// Re-reconcile when optional operator CRDs (e.g. Perses from COO) are installed
 		// so that resources previously skipped due to missing CRDs are applied immediately.
-		Watches(
-			&extv1.CustomResourceDefinition{},
+		// Metadata-only: avoids caching full CRD objects (50–200KB each with OpenAPI schemas).
+		WatchesMetadata(
+			crdPartialMetadata(),
 			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
 				return []reconcile.Request{{NamespacedName: types.NamespacedName{
 					Namespace: r.DeploymentNS,

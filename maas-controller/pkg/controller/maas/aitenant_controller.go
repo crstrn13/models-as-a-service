@@ -1275,6 +1275,16 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 		if !isNotFoundError(err) {
 			return false, fmt.Errorf("get API key revocation Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
+		operandsReady, err := r.prepareRevocationOperands(ctx, aitenant)
+		if err != nil {
+			return false, err
+		}
+		if tenantAPIKeysRevoked(aitenant) {
+			return true, nil
+		}
+		if !operandsReady {
+			return false, nil
+		}
 		if err := r.Create(ctx, job); err != nil {
 			if !isAlreadyExistsError(err) {
 				return false, fmt.Errorf("create API key revocation Job %s/%s: %w", job.Namespace, job.Name, err)
@@ -1324,7 +1334,7 @@ func (r *AITenantReconciler) markTenantAPIKeysRevoked(ctx context.Context, aiten
 	apimeta.SetStatusCondition(&aitenant.Status.Conditions, metav1.Condition{
 		Type:               aitenantAPIKeysRevokedCondition,
 		Status:             metav1.ConditionTrue,
-		Reason:             "RevocationJobCompleted",
+		Reason:             aitenantAPIKeysRevokedReasonJobCompleted,
 		Message:            "Tenant API keys were revoked",
 		ObservedGeneration: aitenant.Generation,
 		LastTransitionTime: metav1.Now(),
