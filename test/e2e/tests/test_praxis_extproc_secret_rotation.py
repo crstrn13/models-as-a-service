@@ -244,13 +244,20 @@ def _poll_injected_credential(url: str, headers: dict, body: dict, *, expected: 
             last_cred = _echoed_authorization(r)
             if last_cred == expected:
                 return last_cred
-            log.info("Echo poll: upstream credential=%r (want %r), retrying...", last_cred, expected)
+            # Never log the credential value itself (CWE-532): on injection
+            # failure the upstream may echo the client's Authorization header,
+            # which carries the test's API key. Report presence only.
+            log.info(
+                "Echo poll: upstream credential did not match expected "
+                "(credential present=%s), retrying...",
+                last_cred is not None,
+            )
         else:
             log.info("Echo poll got transient %d, retrying...", r.status_code)
         time.sleep(2)
     raise AssertionError(
-        f"upstream never received credential {expected!r} within {timeout}s "
-        f"(last status={last_status}, last credential={last_cred!r})"
+        f"upstream never received the expected credential within {timeout}s "
+        f"(last status={last_status}, credential present={last_cred is not None})"
     )
 
 
@@ -406,6 +413,10 @@ class TestPraxisExtProcSecretRotation:
         for deployment, uids in before_uids.items():
             assert uids, f"no {deployment} pods found before rotation"
 
+        model_before = _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS)
+        assert model_before is not None, "ExternalModel missing before rotation"
+        model_uid_before = model_before["metadata"]["uid"]
+
         _apply_provider_secret(SECRET_VALUE_V2)
         assert _get_cr("secret", SECRET_NAME, EXTERNAL_NS) is not None, (
             "provider Secret vanished after in-place rotation"
@@ -424,6 +435,11 @@ class TestPraxisExtProcSecretRotation:
                 f"(before={uids}, after={after_uids}); rotation must not restart ExtProc"
             )
 
-        assert _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS) is not None, (
+        model_after = _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS)
+        assert model_after is not None, (
             "ExternalModel disappeared during in-place Secret rotation"
+        )
+        assert model_after["metadata"]["uid"] == model_uid_before, (
+            "ExternalModel was deleted and recreated during in-place Secret rotation "
+            "(UID changed); rotation must not recreate the ExternalModel"
         )
