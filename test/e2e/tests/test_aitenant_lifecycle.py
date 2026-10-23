@@ -655,9 +655,6 @@ class TestAITenantLifecycle:
             _apply_aitenant(case)
             _assert_aitenant_bootstrap_resources(case)
 
-            # While live, the AITenant-managed MaasTenantConfig must carry the
-            # cleanup finalizer (the controller adds it in tenant_reconcile.go only
-            # for AITenant-managed tenants, which is exactly what this fixture creates).
             wait_for_finalizer(
                 TENANT_CONFIG_KIND,
                 TENANT_NAME,
@@ -665,10 +662,7 @@ class TestAITenantLifecycle:
                 FINALIZER_TENANT_CLEANUP,
             )
 
-            # Deleting the owning AITenant must release the finalizer and let the
-            # MaasTenantConfig be garbage-collected. A stuck finalizer would leave the
-            # object wedged with a deletionTimestamp forever, so reaching NotFound
-            # within the timeout is the proof that the finalizer was released cleanly.
+            
             _delete_aitenant(case)
             _wait_for_not_found(TENANT_CONFIG_KIND, TENANT_NAME, case["tenant_ns"], timeout=240)
         finally:
