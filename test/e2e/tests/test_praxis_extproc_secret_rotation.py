@@ -39,6 +39,7 @@ Praxis topology notes (why the resources live where they do):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -150,10 +151,18 @@ pytestmark = [
 
 
 def _skip_unless_default_praxis():
-    if not _check_ipp_pods_deployed():
-        pytest.skip("Default payload-processing stack is not ready")
+    # Skip only when praxis-extproc isn't the configured dataplane (or the
+    # Deployment is absent) — that's genuinely not this test's scenario.
     if not extproc_deployment_uses_praxis(PROCESSING_DEPLOYMENT):
         pytest.skip("default tenant payload-processing is not praxis-extproc")
+    # Praxis IS the dataplane: a transient rollout must not silently skip this
+    # test. Wait for the IPP pods to become ready, and fail if they never do.
+    deadline = time.time() + EGRESS_POLL_TIMEOUT
+    while time.time() < deadline:
+        if _check_ipp_pods_deployed():
+            return
+        time.sleep(5)
+    pytest.fail("Default payload-processing stack never became ready")
 
 
 def _extproc_pod_uids(deployment: str, namespace: str, *, label: str | None = None) -> set[str]:
@@ -164,9 +173,21 @@ def _extproc_pod_uids(deployment: str, namespace: str, *, label: str | None = No
     """
     selector = label or f"{LABEL_TENANT_INSTANCE}={deployment}"
     result = _oc_run(
-        ["get", "pods", "-n", namespace, "-l", selector, "-o", "jsonpath={.items[*].metadata.uid}"]
+        ["get", "pods", "-n", namespace, "-l", selector, "-o", "json"]
     )
-    return {uid for uid in (result.stdout or "").split() if uid}
+    try:
+        items = json.loads(result.stdout or "{}").get("items", [])
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    # Exclude terminating pods (deletionTimestamp set): a pod on its way out
+    # must not count as "surviving" the rotation, or a restart caught mid-flight
+    # would be masked.
+    return {
+        meta["uid"]
+        for pod in items
+        for meta in (pod.get("metadata", {}),)
+        if meta.get("uid") and not meta.get("deletionTimestamp")
+    }
 
 
 def _all_extproc_uids() -> dict[str, set[str]]:
@@ -430,8 +451,8 @@ class TestPraxisExtProcSecretRotation:
 
         for deployment, uids in before_uids.items():
             after_uids = _extproc_uids_for(deployment)
-            assert uids <= after_uids, (
-                f"{deployment} pods were replaced during in-place rotation "
+            assert after_uids == uids, (
+                f"{deployment} pods changed during in-place rotation "
                 f"(before={uids}, after={after_uids}); rotation must not restart ExtProc"
             )
 
