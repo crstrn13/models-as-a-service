@@ -216,6 +216,13 @@ def _deployment_ns(deployment: str) -> str:
     return EXTERNAL_NS if deployment == EXTERNAL_MODEL_DEPLOYMENT else GATEWAY_NAMESPACE
 
 
+def _extproc_selector(deployment: str) -> str:
+    """Pod label selector for an ExtProc Deployment (same as the UID snapshot)."""
+    if deployment == EXTERNAL_MODEL_DEPLOYMENT:
+        return f"app={deployment}"
+    return f"{LABEL_TENANT_INSTANCE}={deployment}"
+
+
 def _extproc_generation(deployment: str) -> str:
     """``.metadata.generation`` of an ExtProc Deployment.
 
@@ -229,6 +236,36 @@ def _extproc_generation(deployment: str) -> str:
          "-o", "jsonpath={.metadata.generation}"]
     )
     return (result.stdout or "").strip()
+
+
+def _extproc_restart_counts(deployment: str) -> dict[tuple[str, str], int]:
+    """Container restart counts keyed by ``(pod UID, container name)``.
+
+    The pod-UID and Deployment-generation checks miss an *in-place* container
+    restart: the ExtProc process crashing (or being killed by a liveness probe)
+    and restarting inside the same pod bumps ``restartCount`` without changing
+    the pod UID or the Deployment generation. Rotation must not restart the
+    container either, so snapshot these and require them unchanged.
+    """
+    result = _oc_run(
+        ["get", "pods", "-n", _deployment_ns(deployment),
+         "-l", _extproc_selector(deployment), "-o", "json"]
+    )
+    try:
+        items = json.loads(result.stdout or "{}").get("items", [])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    counts: dict[tuple[str, str], int] = {}
+    for pod in items:
+        meta = pod.get("metadata", {})
+        uid = meta.get("uid")
+        if not uid or meta.get("deletionTimestamp"):
+            continue
+        for cs in pod.get("status", {}).get("containerStatuses", []) or []:
+            name = cs.get("name")
+            if name is not None:
+                counts[(uid, name)] = cs.get("restartCount", 0)
+    return counts
 
 
 def _apply_provider_secret(value: str):
@@ -480,6 +517,7 @@ class TestPraxisExtProcSecretRotation:
         for deployment, uids in before_uids.items():
             assert uids, f"no {deployment} pods found before rotation"
         before_gens = {d: _extproc_generation(d) for d in before_uids}
+        before_restarts = {d: _extproc_restart_counts(d) for d in before_uids}
 
         model_before = _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS)
         assert model_before is not None, "ExternalModel missing before rotation"
@@ -512,6 +550,17 @@ class TestPraxisExtProcSecretRotation:
                 f"{deployment} pods were replaced during in-place rotation "
                 f"(before={uids}, after={after_uids}); rotation must not restart ExtProc"
             )
+            # No in-place container restart: every container we saw before must
+            # still be present with the same restartCount (a crash/liveness kill
+            # within the same pod would bump it without changing pod UID/gen).
+            after_restarts = _extproc_restart_counts(deployment)
+            for key, count in before_restarts[deployment].items():
+                pod_uid, container = key
+                assert after_restarts.get(key) == count, (
+                    f"{deployment} container {container} restarted during in-place rotation "
+                    f"(pod {pod_uid}: {count} -> {after_restarts.get(key)}); "
+                    "rotation must not restart ExtProc"
+                )
 
         model_after = _get_cr(EXTERNAL_MODEL_KIND, EXTERNAL_MODEL_NAME, EXTERNAL_NS)
         assert model_after is not None, (
